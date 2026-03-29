@@ -1,0 +1,303 @@
+---
+title: "Prediction of 30-Day Hospital Readmission in Patients with Diabetes"
+author: "Sara Raees"
+date: "2026-03-29"
+output: powerpoint_presentation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(caret)
+library(naniar)
+library(pROC)
+library(randomForest)
+library(dplyr)
+library(scales)
+```
+
+## Background
+- **Dataset**: Diabetes 130-US Hospitals for Years 1999–2008 (UCI Machine Learning Repository).
+- **Aim**: Develop a prediction model for 30-day hospital readmission among hospitalized patients with diabetes.
+- **Approach**: A stratified sample was used to preserve the proportion of patients readmitted within 30 days.
+
+```{r data-load, include=FALSE, cache=TRUE}
+diabetes_full <- read.csv("diabetic_data.csv", stringsAsFactors = FALSE)
+set.seed(123)
+sample_index <- createDataPartition(diabetes_full$readmitted, p = 20000 / nrow(diabetes_full), list = FALSE)
+diabetes <- diabetes_full[sample_index, ]
+diabetes[diabetes == "?"] <- NA
+diabetes <- diabetes %>%
+  mutate(across(where(is.character), ~ trimws(.))) %>%
+  mutate(across(where(is.character), ~ na_if(., "?"))) %>%
+  mutate(
+    readmit30 = ifelse(readmitted == "<30", 1, 0),
+    readmit30 = factor(readmit30, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+```
+
+## Study Population
+- **Total observations**: `r nrow(diabetes)`
+- **Proportion readmitted within 30 days**: `r round(mean(diabetes$readmitted == "<30", na.rm = TRUE) * 100, 2)`%
+- **Outcome**: Binary variable `readmit30` ("Yes" / "No")
+
+## Missingness Analysis
+
+```{r missingness, fig.width=8, fig.height=5}
+diabetes %>%
+  slice_sample(n = min(5000, nrow(diabetes))) %>%
+  vis_miss()
+```
+
+**Interpretation**: Most variables have near-complete data. However, variables such as weight, medical_specialty, and payer_code show high missingness. Predictors with >50% missing data are excluded prior to modeling.
+
+## Analysis: Age Group
+
+```{r age, fig.width=8, fig.height=5}
+ggplot(diabetes, aes(x = age, fill = readmit30)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("No" = "#4DAF4A", "Yes" = "#E41A1C")) +
+  labs(
+    title = "Proportion of 30-Day Readmission by Age Group",
+    x = "Age Group",
+    y = "Proportion",
+    fill = "Readmitted in 30 Days"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretation**: Readmission proportion slightly varies across age groups. While older patients make up a large portion of the cohort, the proportion of those readmitted within 30 days is comparable across advanced age categories.
+
+## Analysis: Time in Hospital
+
+```{r hosp, fig.width=8, fig.height=4.5}
+ggplot(diabetes, aes(x = readmit30, y = time_in_hospital, fill = readmit30)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_manual(values = c("No" = "#377EB8", "Yes" = "#FF7F00")) +
+  labs(
+    title = "Time in Hospital by 30-Day Readmission Status",
+    x = "30-Day Readmission",
+    y = "Time in Hospital"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: Patients readmitted within 30 days ("Yes") tend to have a slightly higher median time in the hospital during their initial stay compared to those not readmitted ("No"), suggesting longer initial stays may relate to higher readmission risk.
+
+## Analysis: Number of Medications
+
+```{r meds, fig.width=8, fig.height=4.5}
+ggplot(diabetes, aes(x = num_medications, fill = readmit30)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("No" = "#984EA3", "Yes" = "#E41A1C")) +
+  labs(
+    title = "Distribution of Number of Medications",
+    x = "Number of Medications",
+    y = "Count",
+    fill = "Readmitted in 30 Days"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: The distribution of number of medications is right-skewed. The group readmitted within 30 days has a notably wide spread in the number of prescribed medications, which may be a proxy for more complex or severe underlying health conditions.
+
+## Methods
+- **Identifier Removal**: Excluded `encounter_id`, `patient_nbr`.
+- **Threshold**: Removed predictors with >50% missingness.
+- **Train/Test Split**: 70% Training / 30% Testing.
+- **Imputation**:
+  - Numeric: Median Imputation
+  - Categorical: Added "Missing" category
+- **Models Evaluated**:
+  1. Logistic Regression
+  2. Random Forest (`ntree = 300`)
+
+```{r methods-prep, include=FALSE}
+diabetes_model <- diabetes %>%
+  select(-encounter_id, -patient_nbr, -readmitted) %>%
+  mutate(across(where(is.character), as.factor))
+
+missing_threshold <- 0.5
+diabetes_model <- diabetes_model %>%
+  select(where(~ mean(is.na(.)) < missing_threshold))
+
+set.seed(123)
+train_index <- createDataPartition(diabetes_model$readmit30, p = 0.7, list = FALSE)
+train_data <- diabetes_model[train_index, ]
+test_data  <- diabetes_model[-train_index, ]
+
+train_data_imputed <- train_data
+test_data_imputed  <- test_data
+
+num_vars <- names(train_data_imputed)[sapply(train_data_imputed, is.numeric)]
+for (v in num_vars) {
+  med <- median(train_data_imputed[[v]], na.rm = TRUE)
+  if (is.na(med)) med <- 0
+  train_data_imputed[[v]][is.na(train_data_imputed[[v]])] <- med
+  test_data_imputed[[v]][is.na(test_data_imputed[[v]])] <- med
+}
+
+cat_vars <- names(train_data_imputed)[sapply(train_data_imputed, is.factor)]
+for (v in cat_vars) {
+  train_data_imputed[[v]] <- addNA(train_data_imputed[[v]])
+  levels(train_data_imputed[[v]])[is.na(levels(train_data_imputed[[v]]))] <- "Missing"
+  test_data_imputed[[v]] <- factor(test_data_imputed[[v]], levels = levels(train_data_imputed[[v]]))
+  test_data_imputed[[v]] <- addNA(test_data_imputed[[v]])
+  levels(test_data_imputed[[v]])[is.na(levels(test_data_imputed[[v]]))] <- "Missing"
+}
+
+train_data_imputed <- train_data_imputed %>% mutate(across(where(is.character), as.factor)) %>% mutate(across(where(is.factor), droplevels))
+test_data_imputed <- test_data_imputed %>% mutate(across(where(is.character), as.factor)) %>% mutate(across(where(is.factor), droplevels))
+
+bad_vars <- names(train_data_imputed)[sapply(train_data_imputed, function(x) { if (is.factor(x)) length(unique(na.omit(x))) < 2 else FALSE })]
+train_data_imputed <- train_data_imputed %>% select(-all_of(bad_vars))
+test_data_imputed  <- test_data_imputed %>% select(-all_of(bad_vars))
+
+nzv <- nearZeroVar(train_data_imputed)
+if (length(nzv) > 0) {
+  train_data_imputed <- train_data_imputed[, -nzv, drop = FALSE]
+  test_data_imputed  <- test_data_imputed[, colnames(train_data_imputed), drop = FALSE]
+}
+```
+
+```{r logit-model, include=FALSE}
+logit_model <- glm(readmit30 ~ ., data = train_data_imputed, family = binomial)
+test_data_imputed$readmit30 <- factor(test_data_imputed$readmit30, levels = c("No", "Yes"))
+factor_cols_logit <- names(train_data_imputed)[sapply(train_data_imputed, is.factor)]
+for (col in factor_cols_logit) {
+  if (col %in% names(test_data_imputed)) {
+    test_data_imputed[[col]] <- as.character(test_data_imputed[[col]])
+    test_data_imputed[[col]][!(test_data_imputed[[col]] %in% levels(train_data_imputed[[col]]))] <- NA
+    test_data_imputed[[col]] <- factor(test_data_imputed[[col]], levels = levels(train_data_imputed[[col]]))
+  }
+}
+test_logit_clean <- test_data_imputed[complete.cases(test_data_imputed), ]
+logit_pred_prob <- predict(logit_model, newdata = test_logit_clean, type = "response")
+roc_logit <- roc(response = test_logit_clean$readmit30, predictor = logit_pred_prob, levels = c("No", "Yes"), direction = "<")
+calibration_df <- data.frame(observed = ifelse(test_logit_clean$readmit30 == "Yes", 1, 0), predicted = logit_pred_prob)
+calibration_plot_data <- calibration_df %>% mutate(decile = ntile(predicted, 10)) %>% group_by(decile) %>% summarise(mean_predicted = mean(predicted), mean_observed = mean(observed), .groups = "drop")
+brier_logit <- mean((calibration_df$observed - calibration_df$predicted)^2)
+```
+
+## Logistic Regression: ROC Curve
+
+```{r logit-roc, fig.width=8, fig.height=5.5}
+plot(roc_logit, col = "#1F78B4", lwd = 3, main = "ROC Curve - Logistic Regression")
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+```
+
+## Logistic Regression: Calibration
+
+```{r logit-calib, fig.width=8, fig.height=5}
+ggplot(calibration_plot_data, aes(x = mean_predicted, y = mean_observed)) +
+  geom_point(size = 3, colour = "#E41A1C") +
+  geom_line(colour = "#E41A1C") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "grey40") +
+  labs(
+    title = "Calibration Plot - Logistic Regression",
+    x = "Mean Predicted Probability",
+    y = "Observed Proportion"
+  ) +
+  theme_minimal()
+```
+
+```{r rf-model, include=FALSE}
+high_card_vars <- names(train_data_imputed)[sapply(train_data_imputed, function(x) { is.factor(x) && nlevels(x) > 53 })]
+train_rf <- train_data_imputed %>% select(-all_of(high_card_vars))
+test_rf <- test_data_imputed %>% select(all_of(names(train_rf)))
+train_rf$readmit30 <- factor(train_rf$readmit30, levels = c("No", "Yes"))
+test_rf$readmit30  <- factor(test_rf$readmit30,  levels = c("No", "Yes"))
+
+set.seed(123)
+rf_model <- randomForest(readmit30 ~ ., data = train_rf, ntree = 300, importance = TRUE)
+
+factor_cols <- names(train_rf)[sapply(train_rf, is.factor)]
+for (col in factor_cols) {
+  if (col %in% names(test_rf)) {
+    test_rf[[col]] <- as.character(test_rf[[col]])
+    test_rf[[col]][!(test_rf[[col]] %in% levels(train_rf[[col]]))] <- NA
+    test_rf[[col]] <- factor(test_rf[[col]], levels = levels(train_rf[[col]]))
+  }
+}
+for (col in names(train_rf)) {
+  if (col %in% names(test_rf)) {
+    if (is.numeric(train_rf[[col]]) && !is.factor(train_rf[[col]])) test_rf[[col]] <- as.numeric(test_rf[[col]])
+    else if (is.integer(train_rf[[col]])) test_rf[[col]] <- as.integer(test_rf[[col]])
+    else if (is.logical(train_rf[[col]])) test_rf[[col]] <- as.logical(test_rf[[col]])
+  }
+}
+test_rf_clean <- test_rf[complete.cases(test_rf), ]
+rf_pred_class <- predict(rf_model, newdata = test_rf_clean, type = "class")
+rf_pred_prob  <- predict(rf_model, newdata = test_rf_clean, type = "prob")[, "Yes"]
+roc_rf <- roc(response = test_rf_clean$readmit30, predictor = rf_pred_prob, levels = c("No", "Yes"), direction = "<")
+rf_calibration_df <- data.frame(observed = ifelse(test_rf_clean$readmit30 == "Yes", 1, 0), predicted = rf_pred_prob)
+rf_calibration_plot_data <- rf_calibration_df %>% mutate(decile = ntile(predicted, 10)) %>% group_by(decile) %>% summarise(mean_predicted = mean(predicted), mean_observed = mean(observed), .groups = "drop")
+brier_rf <- mean((rf_calibration_df$observed - rf_calibration_df$predicted)^2)
+```
+
+## Random Forest: ROC Curve
+
+```{r rf-roc, fig.width=8, fig.height=5.5}
+plot(roc_rf, col = "#33A02C", lwd = 3, main = "ROC Curve - Random Forest")
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+```
+
+## Random Forest: Calibration
+
+```{r rf-calib, fig.width=8, fig.height=5}
+ggplot(rf_calibration_plot_data, aes(x = mean_predicted, y = mean_observed)) +
+  geom_point(size = 3, colour = "#33A02C") +
+  geom_line(colour = "#33A02C") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "grey40") +
+  labs(
+    title = "Calibration Plot - Random Forest",
+    x = "Mean Predicted Probability",
+    y = "Observed Proportion"
+  ) +
+  theme_minimal()
+```
+
+## Random Forest: Variable Importance
+
+```{r rf-varimp, fig.width=8, fig.height=5.5}
+varImpPlot(rf_model, main = "Variable Importance - Random Forest")
+```
+
+**Interpretation**: Variables like `num_lab_procedures`, `num_medications`, `time_in_hospital`, and `age` consistently emerge as the most important predictors in the model. This emphasizes that healthcare utilization and demographic factors during the initial admission are key indicators of potential readmission risk.
+
+## Model Comparison
+
+```{r model-comp, fig.width=8, fig.height=5}
+plot(roc_logit, col = "#1F78B4", lwd = 3, main = "ROC Curves for Both Models")
+plot(roc_rf, col = "#33A02C", lwd = 3, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend(
+  "bottomright",
+  legend = c(
+    paste("Logistic Regression AUC =", round(as.numeric(auc(roc_logit)), 3)),
+    paste("Random Forest AUC =", round(as.numeric(auc(roc_rf)), 3))
+  ),
+  col = c("#1F78B4", "#33A02C"),
+  lwd = 3,
+  bty = "n"
+)
+```
+
+## Summary & Conclusion
+
+- **Logistic Regression**: 
+  - AUC: `r round(as.numeric(auc(roc_logit)), 3)` | Brier Score: `r round(brier_logit, 4)`
+  - Performance is slightly better than random baseline, limited discriminatory ability.
+- **Random Forest**:
+  - AUC: `r round(as.numeric(auc(roc_rf)), 3)` | Brier Score: `r round(brier_rf, 4)`
+  - Outperformed Logistic Regression with better overall discrimination and prediction accuracy.
+- **Conclusion**: Predicting 30-day hospital readmission is challenging; Random Forest identifies high-risk patients better.
+
+## Project Information
+
+- Full code and analysis available on GitHub:
+- **[https://github.com/sararaees786/Predictive-Modelling](https://github.com/sararaees786/Predictive-Modelling)**

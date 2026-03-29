@@ -1,0 +1,355 @@
+---
+title: "Prediction of 30-Day Hospital Readmission in Patients with Diabetes"
+author: "Sara Raees"
+output: html_document
+date: "2026-03-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(caret)
+library(naniar)
+library(pROC)
+library(randomForest)
+```
+
+
+#Background
+
+This project uses the Diabetes 130-US Hospitals for Years 1999–2008 dataset from the UCI Machine Learning Repository. The aim is to develop a prediction model for 30-day hospital readmission among hospitalized patients with diabetes.
+
+#Load, Read and Inspect the dataset
+```{r}
+diabetes <- read.csv("diabetic_data.csv", stringsAsFactors = FALSE)
+
+dim(diabetes)
+
+names(diabetes)
+
+```
+#Initital data overview
+```{r}
+glimpse(diabetes)
+summary(diabetes)
+```
+
+#Replace "?" with NA
+
+```{r}
+diabetes <- diabetes %>%
+  mutate(across(where(is.character), ~ na_if(., "?")))
+```
+
+
+#Define the outcome variable
+The original variable readmitted has three categories:
+
+"NO" = no readmission
+">30" = readmission after 30 days
+"<30" = readmission within 30 days
+
+We create a binary outcome:
+
+1 = readmitted within 30 days
+0 = not readmitted within 30 days
+
+```{r}
+diabetes <- diabetes %>%
+  mutate(readmit30 = ifelse(readmitted == "<30", 1, 0),
+         readmit30 = factor(readmit30, levels = c(0, 1),
+                            labels = c("No", "Yes")))
+```
+
+#Study population and outcome frequency
+```{r}
+# Total number of observations
+nrow(diabetes)
+
+# Total number of predictors before excluding IDs/outcome
+ncol(diabetes) - 1
+
+# Outcome distribution
+table(diabetes$readmitted)
+table(diabetes$readmit30)
+
+# Proportion readmitted within 30 days
+prop.table(table(diabetes$readmit30))
+```
+#Count number of patients readmitted within 30 days
+```{r}
+sum(diabetes$readmitted == "<30", na.rm = TRUE)
+```
+
+
+#Missing data assessment
+```{r}
+# Number of missing values per variable
+missing_counts <- colSums(is.na(diabetes))
+
+# Proportion missing per variable
+missing_prop <- colMeans(is.na(diabetes)) * 100
+
+missing_summary <- data.frame(
+  Variable = names(diabetes),
+  Missing_Count = missing_counts,
+  Missing_Percent = round(missing_prop, 2)
+) %>%
+  arrange(desc(Missing_Percent))
+
+missing_summary
+```
+
+
+```{r}
+# Visualize missingness
+diabetes %>%
+  slice_sample(n = 5000) %>%
+  vis_miss()
+```
+
+#Descriptive analysis of selected variables
+```{r}
+# Age distribution
+table(diabetes$age)
+
+# Gender distribution
+table(diabetes$gender, useNA = "ifany")
+
+# Race distribution
+table(diabetes$race, useNA = "ifany")
+
+# Summary of selected numeric variables
+diabetes %>%
+  select(time_in_hospital, num_lab_procedures, num_procedures,
+         num_medications, number_outpatient, number_emergency,
+         number_inpatient, number_diagnoses) %>%
+  summary()
+```
+
+#Select variables for modelling
+
+Remove identifier variables that should not be used as predictors.
+```{r}
+diabetes_model <- diabetes %>%
+  select(-encounter_id, -patient_nbr, -readmitted)
+```
+
+#Convert character variables to factors
+```{r}
+diabetes_model <- diabetes_model %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+#Remove variables with very high missingness
+
+```{r}
+missing_threshold <- 0.5
+
+diabetes_model <- diabetes_model %>%
+  select(where(~ mean(is.na(.)) < missing_threshold))
+
+dim(diabetes_model)
+```
+
+#Train/test split
+```{r}
+set.seed(123)
+
+train_index <- createDataPartition(diabetes_model$readmit30, p = 0.7, list = FALSE)
+
+train_data <- diabetes_model[train_index, ]
+test_data  <- diabetes_model[-train_index, ]
+
+dim(train_data)
+dim(test_data)
+```
+
+#Simple imputation
+
+For a first analysis:
+
+- numeric variables: median imputation
+- categorical variables: create "Missing" level
+```{r}
+train_data_imputed <- train_data
+test_data_imputed  <- test_data
+
+# Numeric median imputation
+num_vars <- names(train_data_imputed)[sapply(train_data_imputed, is.numeric)]
+
+for (v in num_vars) {
+  med <- median(train_data_imputed[[v]], na.rm = TRUE)
+  train_data_imputed[[v]][is.na(train_data_imputed[[v]])] <- med
+  test_data_imputed[[v]][is.na(test_data_imputed[[v]])] <- med
+}
+
+# Categorical missing category
+cat_vars <- names(train_data_imputed)[sapply(train_data_imputed, is.factor)]
+
+for (v in cat_vars) {
+  train_data_imputed[[v]] <- addNA(train_data_imputed[[v]])
+  levels(train_data_imputed[[v]])[is.na(levels(train_data_imputed[[v]]))] <- "Missing"
+  
+  test_data_imputed[[v]] <- factor(test_data_imputed[[v]],
+                                   levels = levels(train_data_imputed[[v]]))
+  test_data_imputed[[v]] <- addNA(test_data_imputed[[v]])
+  levels(test_data_imputed[[v]])[is.na(levels(test_data_imputed[[v]]))] <- "Missing"
+}
+```
+
+#Logistic regression model
+```{r}
+# Convert character to factor
+train_data_imputed <- train_data_imputed %>%
+  mutate(across(where(is.character), as.factor))
+
+test_data_imputed <- test_data_imputed %>%
+  mutate(across(where(is.character), as.factor))
+
+# Match test levels to train
+for (v in names(train_data_imputed)) {
+  if (is.factor(train_data_imputed[[v]]) && v %in% names(test_data_imputed)) {
+    test_data_imputed[[v]] <- factor(test_data_imputed[[v]],
+                                     levels = levels(train_data_imputed[[v]]))
+  }
+}
+
+# Drop unused levels
+train_data_imputed <- train_data_imputed %>%
+  mutate(across(where(is.factor), droplevels))
+
+test_data_imputed <- test_data_imputed %>%
+  mutate(across(where(is.factor), droplevels))
+
+# Remove factor columns with fewer than 2 observed categories
+bad_vars <- names(train_data_imputed)[sapply(train_data_imputed, function(x) {
+  if (is.factor(x)) {
+    length(unique(na.omit(x))) < 2
+  } else {
+    FALSE
+  }
+})]
+
+bad_vars
+
+train_data_imputed <- train_data_imputed %>% select(-all_of(bad_vars))
+test_data_imputed  <- test_data_imputed %>% select(-all_of(bad_vars))
+
+# Fit logistic regression
+logit_model <- glm(readmit30 ~ ., data = train_data_imputed, family = binomial)
+
+summary(logit_model)
+```
+
+#Test set predictions
+
+```{r}
+pred_prob <- predict(logit_model, newdata = test_data_imputed, type = "response")
+pred_class <- ifelse(pred_prob > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+
+confusionMatrix(pred_class, test_data_imputed$readmit30, positive = "Yes")
+```
+```{r}
+# Predicted probabilities on test data
+logit_pred_prob <- predict(logit_model, newdata = test_data_imputed, type = "response")
+
+# Predicted classes using 0.5 cutoff
+logit_pred_class <- ifelse(logit_pred_prob > 0.5, "Yes", "No") %>%
+  factor(levels = c("No", "Yes"))
+
+# Confusion matrix
+confusionMatrix(logit_pred_class, test_data_imputed$readmit30, positive = "Yes")
+```
+```{r}
+# ROC and AUC
+roc_logit <- roc(response = test_data_imputed$readmit30,
+                 predictor = logit_pred_prob,
+                 levels = c("No", "Yes"))
+
+auc(roc_logit)
+plot(roc_logit, main = "ROC Curve - Logistic Regression")
+```
+```{r}
+# Create calibration data
+calibration_df <- data.frame(
+  observed = ifelse(test_data_imputed$readmit30 == "Yes", 1, 0),
+  predicted = logit_pred_prob
+)
+
+# Group predictions into deciles
+calibration_plot_data <- calibration_df %>%
+  mutate(decile = ntile(predicted, 10)) %>%
+  group_by(decile) %>%
+  summarise(
+    mean_predicted = mean(predicted),
+    mean_observed = mean(observed),
+    .groups = "drop"
+  )
+
+calibration_plot_data
+```
+
+```{r}
+# Calibration plot
+ggplot(calibration_plot_data, aes(x = mean_predicted, y = mean_observed)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "Calibration Plot - Logistic Regression",
+    x = "Mean Predicted Probability",
+    y = "Observed Proportion"
+  ) +
+  theme_minimal()
+```
+```{r}
+# Brier score
+brier_logit <- mean((calibration_df$observed - calibration_df$predicted)^2)
+brier_logit
+```
+
+```{r}
+train_rf <- train_data_imputed %>%
+  select(-any_of(c("diag_1", "diag_2", "diag_3", "medical_specialty")))
+
+test_rf <- test_data_imputed %>%
+  select(-any_of(c("diag_1", "diag_2", "diag_3", "medical_specialty")))
+```
+
+
+```{r}
+set.seed(123)
+
+rf_model <- randomForest(
+  readmit30 ~ .,
+  data = train_rf,
+  ntree = 300,
+  importance = TRUE
+)
+
+print(rf_model)
+```
+
+```{r}
+rf_pred_class <- predict(rf_model, newdata = test_rf, type = "class")
+rf_pred_prob  <- predict(rf_model, newdata = test_rf, type = "prob")[, "Yes"]
+
+confusionMatrix(rf_pred_class, test_rf$readmit30, positive = "Yes")
+```
+
+
+#Brief summary
+```{r}
+cat("Total observations:", nrow(diabetes), "\n")
+cat("Total variables:", ncol(diabetes), "\n")
+cat("Number readmitted within 30 days:", sum(diabetes$readmitted == "<30", na.rm = TRUE), "\n")
+cat("Proportion readmitted within 30 days:",
+    round(mean(diabetes$readmitted == "<30", na.rm = TRUE) * 100, 2), "%\n")
+```
+
